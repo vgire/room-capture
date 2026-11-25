@@ -1,15 +1,23 @@
-// Room capture in WebXR (Chrome on Android, ARCore). The foot of the walls is traced
+// Room capture in WebXR (Chrome on Android, ARCore), two modes.
+//
+// Film (recommended): a walk round the room filming it, as for a video; with WebXR's raw
+// camera access each kept frame comes with ARCore's pose and the camera's intrinsics, and
+// all go out in a zip that painter-room hands to MapAnything (poses known, metric scale
+// from ARCore).
+//
+// Trace (no camera access): the foot of the walls is traced
 // freely with the reticle on the floor ARCore finds (finger on the screen); the walls and
 // the room's outline form as one goes (layout.js), hidden corners being where the walls
 // meet. The height comes from two sights, the foot of a wall then its top: no ceiling
 // needs to be detected. Exported as JSON (schema painter-capture/1, apps/capture/README.md).
 import * as THREE from "three";
-import { captureRecord, median } from "./geometry.js";
+import { captureRecord, cvPose, intrinsics, median } from "./geometry.js";
+import { zipParts } from "./zip.js";
 import { heightAbove, solveRoom, area } from "./layout.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = {
-  start: $("start"), status: $("status"), name: $("name"), overlay: $("overlay"), hint: $("hint"),
+  start: $("start"), startFilm: $("start-film"), filmDone: $("film-done"), status: $("status"), name: $("name"), overlay: $("overlay"), hint: $("hint"),
   readout: $("readout"), cross: $("cross"), undo: $("undo"), finish: $("finish"), manual: $("manual"),
   manualValue: $("manual-value"), manualOk: $("manual-ok"), skip: $("skip"), export: $("export"), quit: $("quit"),
   result: $("result"), summary: $("summary"), again: $("again"),
@@ -30,6 +38,14 @@ let foot = null;                    // first sight of the height
 let sightHeight = null;             // live, from the second sight
 let measured = null;                // {height, method}
 let lastRecord = null;
+let mode = "trace";                 // or "film"
+let binding = null;                 // XRWebGLBinding, for the camera image
+let shots = [];                     // {file, data (Uint8Array, JPEG), t, width, height, K, pose}
+let shooting = 0;                   // frames being encoded
+let lastShot = null;                // {time, position, forward}
+let filmStart = null;
+let cameraSize = null;              // [w, h] of the camera image
+const FILM = { every: 500, move: 0.08, turnDeg: 6, longSide: 1280, maxFrames: 300 };
 
 async function check() {
   if (!window.isSecureContext) {
@@ -41,12 +57,14 @@ async function check() {
     return fail("Ce navigateur ne permet pas la réalité augmentée (WebXR). Ouvrez la page dans Chrome sur un téléphone Android compatible ARCore.");
   }
   ui.start.disabled = false;
-  ui.start.textContent = "Commencer le relevé";
+  ui.startFilm.disabled = false;
+  ui.startFilm.textContent = "Filmer la pièce";
 }
 
 function fail(message) {
   ui.status.textContent = message;
-  ui.start.textContent = "Relevé impossible sur ce téléphone";
+  ui.startFilm.textContent = "Relevé impossible sur ce téléphone";
+  ui.startFilm.disabled = true;
   ui.start.disabled = true;
 }
 
@@ -69,8 +87,113 @@ function setup() {
   scene.add(reticle, wallLines, roomLine, footMark);
 }
 
+async function startFilm() {
+  if (!renderer) setup();
+  session = await navigator.xr.requestSession("immersive-ar", {
+    requiredFeatures: ["camera-access"],
+    optionalFeatures: ["dom-overlay"],
+    domOverlay: { root: ui.overlay },
+  });
+  await renderer.xr.setSession(session);
+  localSpace = renderer.xr.getReferenceSpace();
+  binding = new XRWebGLBinding(session, renderer.getContext());
+  session.addEventListener("end", onEnd);
+  mode = "film";
+  shots = []; shooting = 0; lastShot = null; filmStart = null; cameraSize = null; lastRecord = null; room = null;
+  draw();
+  ui.overlay.classList.add("on");
+  $("home").hidden = true;
+  refresh();
+  renderer.setAnimationLoop(onFilmFrame);
+}
+
+function onFilmFrame(time, frame) {
+  if (!frame) return;
+  const pose = frame.getViewerPose(localSpace);
+  const view = pose?.views[0];
+  if (view?.camera) {
+    if (filmStart === null) filmStart = time;
+    const m = view.transform.matrix;
+    const position = [m[12], m[13], m[14]], forward = [-m[8], -m[9], -m[10]];
+    const moved = !lastShot || Math.hypot(...position.map((v, i) => v - lastShot.position[i])) > FILM.move
+      || Math.acos(Math.min(1, forward.reduce((a, v, i) => a + v * lastShot.forward[i], 0))) > FILM.turnDeg * Math.PI / 180;
+    if ((!lastShot || time - lastShot.time >= FILM.every) && moved && shooting < 3 && shots.length < FILM.maxFrames) {
+      lastShot = { time, position, forward };
+      shoot(view, time);
+    }
+    ui.readout.textContent = `${shots.length} images · ${Math.round((time - filmStart) / 1000)} s`
+      + (shots.length >= FILM.maxFrames ? " · maximum atteint, touchez « Terminer »" : "");
+  }
+  renderer.render(scene, camera);
+}
+
+// the camera image of this frame, read back while it is valid, then encoded in JPEG
+function shoot(view, time) {
+  const gl = renderer.getContext();
+  const w = view.camera.width, h = view.camera.height;
+  cameraSize = [w, h];
+  const texture = binding.getCameraImage(view.camera);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+  const pixels = new Uint8ClampedArray(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fb);
+  renderer.resetState();
+  const s = Math.min(1, FILM.longSide / Math.max(w, h));
+  const K = intrinsics(view.projectionMatrix, w, h).map((row, r) => (r < 2 ? row.map((v) => v * s) : row));
+  const shot = { t: (time - filmStart) / 1000, K, pose: cvPose(view.transform.matrix) };
+  shooting++;
+  encode(pixels, w, h, s).then((data) => {
+    shot.data = data;
+    shot.width = Math.round(w * s);
+    shot.height = Math.round(h * s);
+    shot.file = `frames/frame_${String(shots.length).padStart(4, "0")}.jpg`;
+    shots.push(shot);
+  }).catch((e) => (ui.hint.textContent = "Image perdue : " + e.message)).finally(() => shooting--);
+}
+
+async function encode(pixels, w, h, s) {
+  const full = new OffscreenCanvas(w, h);
+  full.getContext("2d").putImageData(new ImageData(pixels, w, h), 0, 0);
+  const out = new OffscreenCanvas(Math.round(w * s), Math.round(h * s));
+  const ctx = out.getContext("2d");
+  ctx.setTransform(s, 0, 0, -s, 0, out.height);   // GL rows come bottom first: flip
+  ctx.drawImage(full, 0, 0);
+  const blob = await out.convertToBlob({ type: "image/jpeg", quality: 0.9 });
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function finishFilm() {
+  ui.filmDone.disabled = true;
+  while (shooting > 0) await new Promise((r) => setTimeout(r, 50));
+  const name = ui.name.value.trim() || "piece";
+  shots.sort((a, b) => a.t - b.t);
+  shots.forEach((s, i) => (s.file = `frames/frame_${String(i).padStart(4, "0")}.jpg`));
+  const record = {
+    schema: "painter-capture/1",
+    source: "webxr-arcore-camera",
+    createdAt: new Date().toISOString(),
+    userAgent: navigator.userAgent,
+    camera: { width: cameraSize?.[0], height: cameraSize?.[1] },
+    room: { name },
+    // pose: camera to the WebXR local space (metres, y up), OpenCV camera axes;
+    // K: pixels of the saved image, origin at its top-left corner
+    frames: shots.map(({ file, t, width, height, K, pose }) => ({ file, t: +t.toFixed(3), width, height, K, pose })),
+  };
+  const files = [{ name: "capture.json", data: new TextEncoder().encode(JSON.stringify(record, null, 1)) },
+                 ...shots.map((s) => ({ name: s.file, data: s.data }))];
+  const blob = new Blob(zipParts(files), { type: "application/zip" });
+  lastRecord = { zip: blob, name, frames: shots.length, seconds: shots.length ? shots.at(-1).t : 0 };
+  save(blob, `${name}-webxr.zip`);
+  ui.filmDone.disabled = false;
+  session.end();
+}
+
 async function start() {
   if (!renderer) setup();
+  mode = "trace";
   session = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["hit-test"],
     optionalFeatures: ["dom-overlay"],
@@ -173,6 +296,12 @@ function setHeight(h, method) {
 }
 
 function refresh() {
+  ui.filmDone.hidden = mode !== "film";
+  if (mode === "film") {
+    for (const b of [ui.undo, ui.finish, ui.manual, ui.skip, ui.export, ui.cross]) b.hidden = true;
+    ui.hint.textContent = "Faites lentement le tour de la pièce en filmant les murs, du sol au plafond, puis touchez « Terminer ».";
+    return;
+  }
   const tracingStep = step === "trace";
   ui.undo.hidden = !tracingStep;
   ui.finish.hidden = !tracingStep;
@@ -221,12 +350,16 @@ function exportRoom() {
 }
 
 function download(record) {
-  const blob = new Blob([JSON.stringify(record, null, 1)], { type: "application/json" });
+  if (record.zip) return save(record.zip, `${record.name}-webxr.zip`);
+  save(new Blob([JSON.stringify(record, null, 1)], { type: "application/json" }), `${record.room.name}-webxr.json`);
+}
+
+function save(blob, filename) {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `${record.room.name}-webxr.json`;
+  a.download = filename;
   a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
 }
 
 function onEnd() {
@@ -234,7 +367,11 @@ function onEnd() {
   hitSource?.cancel();
   ui.overlay.classList.remove("on");
   $("home").hidden = false;
-  if (lastRecord) {
+  if (lastRecord?.zip) {
+    ui.result.hidden = false;
+    ui.summary.textContent = `${lastRecord.name}\n${lastRecord.frames} images, ${Math.round(lastRecord.seconds)} s de film\n`
+      + `${(lastRecord.zip.size / 1e6).toFixed(1)} Mo : ${lastRecord.name}-webxr.zip dans les Téléchargements`;
+  } else if (lastRecord) {
     const r = lastRecord.room;
     ui.result.hidden = false;
     ui.summary.textContent = `${r.name}\nSurface au sol : ${r.area.toFixed(2)} m²\nPérimètre : ${r.perimeter.toFixed(2)} m\n`
@@ -246,6 +383,12 @@ function onEnd() {
 // taps on the buttons are not taps on the scene
 ui.overlay.querySelector("#bar").addEventListener("beforexrselect", (e) => e.preventDefault());
 ui.start.addEventListener("click", () => start().catch((e) => (ui.status.textContent = "Erreur : " + e.message)));
+ui.startFilm.addEventListener("click", () => startFilm().catch((e) => {
+  ui.status.textContent = e.name === "NotSupportedError"
+    ? "Ce téléphone ou cette version de Chrome ne donne pas accès à la caméra en réalité augmentée : utilisez « Tracer le pied des murs »."
+    : "Erreur : " + e.message;
+}));
+ui.filmDone.addEventListener("click", () => finishFilm().catch((e) => (ui.hint.textContent = "Export impossible : " + e.message)));
 ui.undo.addEventListener("click", () => {
   if (!strokes.length) return;
   trace.length = strokes.pop();

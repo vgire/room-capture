@@ -56,3 +56,18 @@ export function captureRecord({ name, polygon, floorY, height, heightMethod, sou
     },
   };
 }
+
+// A WebXR view's camera-to-local pose (column-major 4x4, OpenGL camera axes: x right, y up,
+// looking along -z) as a row-major 4x4 in OpenCV camera axes (x right, y down, looking
+// along +z), the convention MapAnything takes: the camera's y and z axes flip.
+export function cvPose(m) {
+  const rows = [0, 1, 2, 3].map((r) => [0, 1, 2, 3].map((c) => m[c * 4 + r]));
+  for (const row of rows.slice(0, 3)) { row[1] = -row[1]; row[2] = -row[2]; }
+  return rows;
+}
+
+// Pinhole intrinsics (pixels, origin at the top-left corner, y down) of an image `w` x `h`
+// seen through a WebXR projection matrix (column-major, OpenGL clip space).
+export function intrinsics(p, w, h) {
+  return [[p[0] * w / 2, 0, (1 - p[8]) * w / 2], [0, p[5] * h / 2, (1 + p[9]) * h / 2], [0, 0, 1]];
+}
