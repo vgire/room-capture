@@ -29,12 +29,11 @@ export function median(values) {
   return n === 0 ? NaN : n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
-// The export, schema "painter-capture/1" (apps/capture/README.md). `corners`: the tapped
-// points in the local space; the floor height is their median, the plan polygon is
-// counter-clockwise.
-export function captureRecord({ name, corners, height, heightMethod, source, userAgent, createdAt }) {
-  const floorY = median(corners.map((c) => c.y));
-  let poly = corners.map(planXY);
+// The export, schema "painter-capture/1" (apps/capture/README.md). `polygon`: the room's
+// outline on the plan (made counter-clockwise here); `trace`: the points traced along the
+// foot of the walls in the local space, kept to work on them again later.
+export function captureRecord({ name, polygon, floorY, height, heightMethod, source, userAgent, createdAt, trace = [] }) {
+  let poly = polygon.map(([x, y]) => [x, y]);
   if (area(poly) < 0) poly = poly.reverse();
   const round = (v) => Math.round(v * 10000) / 10000;
   return {
@@ -53,7 +52,7 @@ export function captureRecord({ name, corners, height, heightMethod, source, use
       doors: [],
       windows: [],
       floorY: round(floorY),
-      corners3d: corners.map((c) => [round(c.x), round(c.y), round(c.z)]),
+      trace: trace.map((c) => [round(c.x), round(c.y), round(c.z)]),
     },
   };
 }

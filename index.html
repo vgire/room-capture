@@ -30,6 +30,13 @@
   #bar { position: absolute; bottom: 0; left: 0; right: 0; display: flex; gap: 8px; padding: 12px; flex-wrap: wrap;
          justify-content: center; background: rgba(0,0,0,.45); pointer-events: auto; }
   #bar button { flex: 1 1 40%; }
+  #manual { display: flex; gap: 8px; flex: 1 1 100%; }
+  #manual[hidden] { display: none; }
+  #manual input { flex: 1; padding: 12px; border-radius: 12px; border: 0; font-size: 16px; }
+  #cross { position: absolute; left: 50%; top: 50%; width: 36px; height: 36px; margin: -18px 0 0 -18px; }
+  #cross::before, #cross::after { content: ""; position: absolute; background: #ffd60a; box-shadow: 0 0 2px #000; }
+  #cross::before { left: 17px; top: 0; width: 2px; height: 36px; }
+  #cross::after { top: 17px; left: 0; height: 2px; width: 36px; }
   #result pre { white-space: pre-wrap; font-size: 13px; }
 </style>
 </head>
@@ -38,8 +45,8 @@
   <h1>Relevé de pièce</h1>
   <p>Mesure la forme de la pièce avec la caméra du téléphone (Chrome sur Android, ARCore). Rien à installer.</p>
   <ol>
-    <li>Placez le viseur au pied d'un coin de la pièce, là où les deux murs touchent le sol, et touchez l'écran. Faites le tour : un coin après l'autre.</li>
-    <li>Touchez « Fermer la pièce », puis visez le plafond et touchez « Mesurer la hauteur ».</li>
+    <li>Visez le sol au pied d'un mur, gardez le doigt sur l'écran et suivez le bas des murs, là où ils sont visibles. Les murs s'affichent en jaune, la pièce en vert quand elle est fermée. Inutile de viser les coins cachés par les meubles.</li>
+    <li>Touchez « Terminer », puis mesurez la hauteur en deux visées : le pied d'un mur, puis le haut du même mur, au ras du plafond.</li>
     <li>Touchez « Exporter » : le relevé est enregistré (fichier .json).</li>
   </ol>
   <label for="name">Nom de la pièce</label>
@@ -55,10 +62,15 @@
 <div id="overlay">
   <div id="hint"></div>
   <div id="readout"></div>
+  <div id="cross" hidden></div>
   <div id="bar">
-    <button id="undo" class="secondary">Annuler le dernier</button>
-    <button id="close">Fermer la pièce</button>
-    <button id="height" hidden>Mesurer la hauteur</button>
+    <button id="undo" class="secondary">Annuler le dernier tracé</button>
+    <button id="finish">Terminer</button>
+    <div id="manual" hidden>
+      <input id="manual-value" inputmode="decimal" placeholder="ou hauteur en m, ex. 2,50">
+      <button id="manual-ok" class="secondary">Valider</button>
+    </div>
+    <button id="skip" class="secondary" hidden>Sans hauteur</button>
     <button id="export" hidden>Exporter</button>
     <button id="quit" class="secondary">Quitter</button>
   </div>

@@ -1,22 +1,33 @@
-// Room capture in WebXR (Chrome on Android, ARCore): the corners of the floor tapped one
-// after the other on the planes ARCore finds, then the ceiling height, exported as JSON
-// (schema painter-capture/1, apps/capture/README.md).
+// Room capture in WebXR (Chrome on Android, ARCore). The foot of the walls is traced
+// freely with the reticle on the floor ARCore finds (finger on the screen); the walls and
+// the room's outline form as one goes (layout.js), hidden corners being where the walls
+// meet. The height comes from two sights, the foot of a wall then its top: no ceiling
+// needs to be detected. Exported as JSON (schema painter-capture/1, apps/capture/README.md).
 import * as THREE from "three";
-import { captureRecord, median, sides } from "./geometry.js";
+import { captureRecord, median } from "./geometry.js";
+import { heightAbove, solveRoom, area } from "./layout.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = {
   start: $("start"), status: $("status"), name: $("name"), overlay: $("overlay"), hint: $("hint"),
-  readout: $("readout"), undo: $("undo"), close: $("close"), height: $("height"), export: $("export"),
-  quit: $("quit"), result: $("result"), summary: $("summary"), again: $("again"),
+  readout: $("readout"), cross: $("cross"), undo: $("undo"), finish: $("finish"), manual: $("manual"),
+  manualValue: $("manual-value"), manualOk: $("manual-ok"), skip: $("skip"), export: $("export"), quit: $("quit"),
+  result: $("result"), summary: $("summary"), again: $("again"),
 };
 
-let renderer, scene, camera, reticle, outline, ceilingMark;
+let renderer, scene, camera, reticle, wallLines, roomLine, footMark;
 let session, hitSource, localSpace;
-let step = "corners";               // corners -> height -> done
-let corners = [];                   // THREE.Vector3, local space
-let lastFloorHit = null;            // THREE.Vector3 under the reticle
-let lastCeiling = null;             // {y, method}
+let step = "trace";                 // trace -> foot -> top -> done
+let trace = [];                     // THREE.Vector3 on the floor, local space
+let strokes = [];                   // start index of each stroke in `trace`
+let stands = [];                    // [x, y] on the plan, where the phone was while tracing
+let tracing = false;
+let floorY = null;
+let lastFloorHit = null;
+let room = null;                    // last solveRoom result
+let solvedAt = 0, solvedCount = 0;
+let foot = null;                    // first sight of the height
+let sightHeight = null;             // live, from the second sight
 let measured = null;                // {height, method}
 let lastRecord = null;
 
@@ -48,153 +59,162 @@ function setup() {
   document.body.appendChild(renderer.domElement);
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 30);
-  reticle = new THREE.Mesh(new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
+  reticle = new THREE.Mesh(new THREE.RingGeometry(0.04, 0.06, 32).rotateX(-Math.PI / 2),
                            new THREE.MeshBasicMaterial({ color: 0x31d18b }));
   reticle.visible = false;
-  scene.add(reticle);
-  outline = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffd60a }));
-  scene.add(outline);
-  ceilingMark = new THREE.Mesh(new THREE.SphereGeometry(0.04), new THREE.MeshBasicMaterial({ color: 0x0a84ff }));
-  ceilingMark.visible = false;
-  scene.add(ceilingMark);
+  wallLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffd60a }));
+  roomLine = new THREE.LineLoop(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x31d18b }));
+  footMark = new THREE.Mesh(new THREE.SphereGeometry(0.03), new THREE.MeshBasicMaterial({ color: 0x0a84ff }));
+  footMark.visible = false;
+  scene.add(reticle, wallLines, roomLine, footMark);
 }
 
 async function start() {
   if (!renderer) setup();
   session = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["hit-test"],
-    optionalFeatures: ["dom-overlay", "depth-sensing"],
+    optionalFeatures: ["dom-overlay"],
     domOverlay: { root: ui.overlay },
-    depthSensing: { usagePreference: ["cpu-optimized"], dataFormatPreference: ["luminance-alpha", "float32"] },
   });
   await renderer.xr.setSession(session);
   localSpace = renderer.xr.getReferenceSpace();
   const viewer = await session.requestReferenceSpace("viewer");
   hitSource = await session.requestHitTestSource({ space: viewer, entityTypes: ["plane"] });
-  session.addEventListener("select", onTap);
+  session.addEventListener("selectstart", () => { if (step === "trace") { tracing = true; strokes.push(trace.length); } });
+  session.addEventListener("selectend", () => { tracing = false; if (strokes.length && strokes.at(-1) === trace.length) strokes.pop(); });
+  session.addEventListener("select", onSelect);
   session.addEventListener("end", onEnd);
-  corners = [];
-  measured = null;
-  step = "corners";
+  trace = []; strokes = []; stands = []; floorY = null; room = null; foot = null; measured = null; sightHeight = null;
+  lastRecord = null;
+  step = "trace";
+  draw();
   ui.overlay.classList.add("on");
-  document.getElementById("home").hidden = true;
+  $("home").hidden = true;
   refresh();
   renderer.setAnimationLoop(onFrame);
 }
 
 function onFrame(time, frame) {
   if (!frame) return;
-  const hits = frame.getHitTestResults(hitSource);
+  const pose = frame.getViewerPose(localSpace);
   lastFloorHit = null;
-  lastCeiling = null;
-  const floorY = corners.length ? median(corners.map((c) => c.y)) : null;
-  for (const hit of hits) {
-    const pose = hit.getPose(localSpace);
-    if (!pose) continue;
+  for (const hit of frame.getHitTestResults(hitSource)) {
+    const p = hit.getPose(localSpace);
+    if (!p) continue;
+    const m = new THREE.Matrix4().fromArray(p.transform.matrix);
+    if (new THREE.Vector3().setFromMatrixColumn(m, 1).y < 0.9) continue;   // not facing up: not the floor
+    const q = new THREE.Vector3().setFromMatrixPosition(m);
+    if (floorY !== null && Math.abs(q.y - floorY) > 0.15) continue;        // a table, a bed
+    lastFloorHit = floorY === null ? q : new THREE.Vector3(q.x, floorY, q.z);
+    break;
+  }
+  if (step === "trace" && tracing && lastFloorHit && pose) addPoint(lastFloorHit, pose);
+  if (step === "top" && pose) {
     const m = new THREE.Matrix4().fromArray(pose.transform.matrix);
-    const p = new THREE.Vector3().setFromMatrixPosition(m);
-    const normalY = new THREE.Vector3().setFromMatrixColumn(m, 1).y;   // plane normal: the pose's y axis
-    if (!lastFloorHit && normalY > 0.9 && (floorY === null || Math.abs(p.y - floorY) < 0.15)) {
-      lastFloorHit = floorY === null ? p : new THREE.Vector3(p.x, floorY, p.z);
-    }
-    if (!lastCeiling && normalY < -0.9 && floorY !== null && p.y - floorY > 1.6) {
-      lastCeiling = { y: p.y, method: "hit-test", point: p };
-    }
+    const eye = new THREE.Vector3().setFromMatrixPosition(m);
+    const dir = new THREE.Vector3(0, 0, -1).transformDirection(m);
+    sightHeight = heightAbove(foot, eye, dir);
+    ui.readout.textContent = sightHeight && sightHeight > 1.5
+      ? `Hauteur visée : ${sightHeight.toFixed(2)} m` : "Montez la visée jusqu'en haut du mur, au ras du plafond.";
   }
-  // no ceiling plane: the depth ARCore estimates at the centre of the screen
-  if (step === "height" && !lastCeiling && floorY !== null) {
-    const pose = frame.getViewerPose(localSpace);
-    const view = pose?.views[0];
-    const depth = view && frame.getDepthInformation ? safe(() => frame.getDepthInformation(view)) : null;
-    if (depth) {
-      const d = depth.getDepthInMeters(0.5, 0.5);
-      if (d > 0.3 && d < 8) {
-        const m = new THREE.Matrix4().fromArray(view.transform.matrix);
-        const p = new THREE.Vector3(0, 0, -d).applyMatrix4(m);
-        const forwardY = new THREE.Vector3().setFromMatrixColumn(m, 2).negate().y;   // the camera looks along -z
-        if (forwardY > 0.7 && p.y - floorY > 1.6) lastCeiling = { y: p.y, method: "depth", point: p };
-      }
-    }
-  }
-  reticle.visible = step === "corners" && !!lastFloorHit;
+  if (step === "trace" && time - solvedAt > 500 && trace.length !== solvedCount) solve(time);
+  reticle.visible = (step === "trace" || step === "foot") && !!lastFloorHit;
   if (reticle.visible) reticle.position.copy(lastFloorHit);
-  ceilingMark.visible = step === "height" && !!lastCeiling;
-  if (ceilingMark.visible) ceilingMark.position.copy(lastCeiling.point);
-  if (step === "height") {
-    ui.readout.textContent = lastCeiling
-      ? `Hauteur visée : ${(lastCeiling.y - floorY).toFixed(2)} m (${lastCeiling.method === "depth" ? "profondeur" : "plan du plafond"})`
-      : "Plafond pas encore trouvé : visez une zone dégagée du plafond.";
-  }
   renderer.render(scene, camera);
 }
 
-function safe(fn) {
-  try { return fn(); } catch { return null; }
+function addPoint(p, pose) {
+  const last = trace.at(-1);
+  if (last && strokes.at(-1) < trace.length && last.distanceTo(p) < 0.02) return;
+  if (floorY === null) floorY = p.y;
+  trace.push(new THREE.Vector3(p.x, floorY, p.z));
+  if (trace.length % 5 === 0) {
+    const e = pose.transform.position;
+    stands.push([e.x, -e.z]);
+  }
 }
 
-function onTap() {
-  if (step !== "corners" || !lastFloorHit) return;
-  corners.push(lastFloorHit.clone());
-  if (corners.length > 1) {   // all corners on the floor height, once known well enough
-    const y = median(corners.map((c) => c.y));
-    corners.forEach((c) => (c.y = y));
-  }
+function solve(time) {
+  solvedAt = time;
+  solvedCount = trace.length;
+  if (trace.length >= 10) floorY = median(trace.map((c) => c.y));
+  const xs = trace.map((c) => c.x), ys = trace.map((c) => -c.z);
+  room = stands.length ? solveRoom(xs, ys, stands.map((s) => s[0]), stands.map((s) => s[1])) : null;
   draw();
   refresh();
 }
 
+const local = ([x, y]) => new THREE.Vector3(x, floorY + 0.01, -y);
+
 function draw() {
-  const pts = corners.map((c) => c.clone().add(new THREE.Vector3(0, 0.01, 0)));
-  if (step !== "corners" && pts.length > 2) pts.push(pts[0]);
-  outline.geometry.dispose();
-  outline.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+  wallLines.geometry.dispose();
+  wallLines.geometry = new THREE.BufferGeometry().setFromPoints(room ? room.walls.flat().map(local) : []);
+  roomLine.geometry.dispose();
+  roomLine.geometry = new THREE.BufferGeometry().setFromPoints(room && room.polygon.length ? room.polygon.map(local) : []);
 }
 
-function plan() {
-  return corners.map((c) => [c.x, -c.z]);
+function onSelect() {
+  if (step === "foot" && lastFloorHit) {
+    foot = lastFloorHit.clone();
+    footMark.position.copy(foot);
+    footMark.visible = true;
+    step = "top";
+    refresh();
+  } else if (step === "top" && sightHeight && sightHeight > 1.5 && sightHeight < 5) {
+    setHeight(sightHeight, "two-sights");
+  }
+}
+
+function setHeight(h, method) {
+  measured = { height: h, method };
+  step = "done";
+  footMark.visible = false;
+  refresh();
 }
 
 function refresh() {
-  const n = corners.length;
-  ui.undo.hidden = step !== "corners";
-  ui.close.hidden = step !== "corners";
-  ui.close.disabled = n < 3;
-  ui.height.hidden = step !== "height";
-  ui.export.hidden = step === "corners";
-  if (step === "corners") {
-    ui.hint.textContent = n === 0
-      ? "Visez le pied d'un coin de la pièce (le viseur vert se pose sur le sol), puis touchez l'écran."
-      : `${n} coin${n > 1 ? "s" : ""}. Passez au coin suivant, en faisant le tour de la pièce.`;
-    const s = n > 1 ? sides(plan()).slice(0, n - 1) : [];
-    ui.readout.textContent = s.length ? "Murs : " + s.map((v) => v.toFixed(2)).join(" · ") + " m" : "";
-  } else if (step === "height") {
-    ui.hint.textContent = "Visez le plafond, puis touchez « Mesurer la hauteur ». Ou exportez sans hauteur.";
-  } else {
-    ui.hint.textContent = `Hauteur : ${measured.height.toFixed(2)} m. Touchez « Exporter ».`;
+  const tracingStep = step === "trace";
+  ui.undo.hidden = !tracingStep;
+  ui.finish.hidden = !tracingStep;
+  ui.finish.disabled = !(room && room.polygon.length);
+  ui.manual.hidden = !(step === "foot" || step === "top");
+  ui.skip.hidden = !(step === "foot" || step === "top");
+  ui.export.hidden = step !== "done";
+  ui.cross.hidden = step !== "top";
+  if (tracingStep) {
+    ui.hint.textContent = trace.length === 0
+      ? "Visez le sol au pied d'un mur, gardez le doigt sur l'écran et suivez le bas des murs. Les coins cachés ne sont pas nécessaires."
+      : "Suivez le bas de chaque mur, là où il est visible. Les murs trouvés s'affichent en jaune, la pièce en vert.";
+    if (!room) ui.readout.textContent = trace.length ? `${trace.length} points` : "";
+    else if (!room.polygon.length) ui.readout.textContent = `${room.walls.length} morceaux de murs. Pièce pas encore fermée : continuez.`;
+    else {
+      const s = Math.abs(area(room.polygon));
+      ui.readout.textContent = `${room.polygon.length} murs · ${s.toFixed(2)} m² · touchez « Terminer » quand tout est vert`;
+    }
+  } else if (step === "foot") {
+    ui.hint.textContent = "Hauteur : visez le pied d'un mur bien dégagé (viseur vert) et touchez l'écran.";
+    ui.readout.textContent = "";
+  } else if (step === "top") {
+    ui.hint.textContent = "Montez la visée (croix) jusqu'en haut du même mur, au ras du plafond, et touchez l'écran.";
+  } else if (step === "done") {
+    ui.hint.textContent = measured ? `Hauteur : ${measured.height.toFixed(2)} m. Touchez « Exporter ».` : "Touchez « Exporter ».";
+    ui.readout.textContent = "";
   }
 }
 
-function closeRoom() {
-  if (corners.length < 3) return;
-  step = "height";
-  draw();
-  refresh();
-}
-
-function measureHeight() {
-  if (!lastCeiling) return;
-  const floorY = median(corners.map((c) => c.y));
-  measured = { height: lastCeiling.y - floorY, method: lastCeiling.method };
-  step = "done";
+function finishTrace() {
+  if (!(room && room.polygon.length)) return;
+  tracing = false;
+  step = "foot";
   refresh();
 }
 
 function exportRoom() {
   const name = ui.name.value.trim() || "piece";
   lastRecord = captureRecord({
-    name, corners: corners.map((c) => ({ x: c.x, y: c.y, z: c.z })), height: measured?.height ?? null,
-    heightMethod: measured?.method ?? null, source: "webxr-arcore", userAgent: navigator.userAgent,
-    createdAt: new Date().toISOString(),
+    name, polygon: room.polygon, floorY, height: measured?.height ?? null, heightMethod: measured?.method ?? null,
+    source: "webxr-arcore", userAgent: navigator.userAgent, createdAt: new Date().toISOString(),
+    trace: trace.map((c) => ({ x: c.x, y: c.y, z: c.z })),
   });
   download(lastRecord);
   session.end();
@@ -213,7 +233,7 @@ function onEnd() {
   renderer.setAnimationLoop(null);
   hitSource?.cancel();
   ui.overlay.classList.remove("on");
-  document.getElementById("home").hidden = false;
+  $("home").hidden = false;
   if (lastRecord) {
     const r = lastRecord.room;
     ui.result.hidden = false;
@@ -226,9 +246,20 @@ function onEnd() {
 // taps on the buttons are not taps on the scene
 ui.overlay.querySelector("#bar").addEventListener("beforexrselect", (e) => e.preventDefault());
 ui.start.addEventListener("click", () => start().catch((e) => (ui.status.textContent = "Erreur : " + e.message)));
-ui.undo.addEventListener("click", () => { corners.pop(); draw(); refresh(); });
-ui.close.addEventListener("click", closeRoom);
-ui.height.addEventListener("click", measureHeight);
+ui.undo.addEventListener("click", () => {
+  if (!strokes.length) return;
+  trace.length = strokes.pop();
+  solvedCount = -1;
+  room = null;
+  draw();
+  refresh();
+});
+ui.finish.addEventListener("click", finishTrace);
+ui.manualOk.addEventListener("click", () => {
+  const h = parseFloat(ui.manualValue.value.replace(",", "."));
+  if (h > 1.5 && h < 6) setHeight(h, "manual");
+});
+ui.skip.addEventListener("click", () => { measured = null; step = "done"; footMark.visible = false; refresh(); });
 ui.export.addEventListener("click", exportRoom);
 ui.quit.addEventListener("click", () => session?.end());
 ui.again.addEventListener("click", () => lastRecord && download(lastRecord));
